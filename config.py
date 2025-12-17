@@ -5,7 +5,9 @@ import google.generativeai as genai
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_community.embeddings import HuggingFaceEmbeddings
 
-load_dotenv()
+env_path = Path(__file__).parent / ".env"
+
+load_dotenv(env_path)
 
 class Config:
     GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
