@@ -16,6 +16,10 @@ class Config:
     
     CHUNK_SIZE = 1000
     CHUNK_OVERLAP = 200
+    #---llm config---
+    USE_LOCAL_LLM = True #set to true to use Ollama or local LLMs
+    OLLAMA_MODEL = "llama3" #for the moment i'm testing with llama3
+    #gemini config
     EMBEDDING_MODEL_NAME = "models/text-embedding-004"
     LLM_MODEL = "gemini-2.0-flash"  # Fixed model name
     
@@ -30,13 +34,14 @@ class Config:
     @classmethod
     def get_embedding_model(cls, use_local=False):
         """Get embedding model - local or API-based"""
-        if use_local:
+        #force local embeddings if using local LLM to be fully offline
+        if use_local or cls.USE_LOCAL_LLM:
             if cls._local_embedding_model is None:
                 cls._local_embedding_model = HuggingFaceEmbeddings(
                     model_name=cls.LOCAL_EMBEDDING_MODEL,
                     model_kwargs={'device': 'cpu'}
                 )
-                print("✓ Local embedding model initialized")
+                print("  Local embedding model initialized")
             return cls._local_embedding_model
         else:
             if cls._embedding_model is None:
@@ -49,16 +54,18 @@ class Config:
     
     @classmethod
     def validate(cls):
-        if not cls.GOOGLE_API_KEY:
+        #only check api key if not using local llm 
+        if not cls.USE_LOCAL_LLM and not cls.GOOGLE_API_KEY:
             raise ValueError("GOOGLE_API_KEY is not set in environment variables.")
         
-        #configure the API key for google generative AI
-        genai.configure(api_key=cls.GOOGLE_API_KEY)
+        if not cls.USE_LOCAL_LLM:
+            genai.configure(api_key=cls.GOOGLE_API_KEY)
+        
         #create necessary directories
         Path(cls.CHROMA_DB_PATH).mkdir( exist_ok=True)
         Path(cls.DOCUMENTS_PATH).mkdir( exist_ok=True)
         
-        print(f"✓ Directories created:")
+        print(f" Directories created:")
         print(f"  - Chroma DB Path: {cls.CHROMA_DB_PATH}")
         print(f"  - Documents Path: {cls.DOCUMENTS_PATH}")
         
@@ -68,17 +75,18 @@ if __name__ == "__main__":
     try:
         print("Validating configuration...")
         Config.validate()
-        print("✓ Configuration is valid.")
-        print(f"✓ Using LLM model: {Config.LLM_MODEL}")
-        print(f"✓ Using Embedding model: {Config.EMBEDDING_MODEL_NAME}")
+        print(" Configuration is valid.")
+        if Config.USE_LOCAL_LLM:
+            print(f" Using local LLM model: {Config.OLLAMA_MODEL}")
+        else:
+            print(f" Using Gemini LLM model: {Config.LLM_MODEL}")
         
         #test embedding model initialization (without actual embedding)
-        embedding_model = Config.get_embedding_model()
-        print("✓ Embedding model initialized successfully.")
+        embedding_model = Config.get_embedding_model(use_local=Config.USE_LOCAL_LLM)
+        print(" Embedding model initialized successfully.")
         
-        print("\n Configuration test passed! Ready to proceed to next step.")
-        print(" Note: Skipping embedding test due to API quota limits.")
+        
         
     except Exception as e:
-        print(f"❌ Configuration validation failed: {e}")
+        print(f" Configuration validation failed: {e}")
         print("Please check your .env file and API key.")

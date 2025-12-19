@@ -95,7 +95,11 @@ class DocumentProcessor:
     
     
 if __name__ == "__main__":
+    from vector_store import VectorStore
+    from config import Config
+    
     processor = DocumentProcessor()
+    config = Config()
     
     documents = processor.process_documents()
     
@@ -106,5 +110,21 @@ if __name__ == "__main__":
         print(f"\nMetadata: {documents[0].metadata}")
         print(f"\n📊 Total files processed: {len(set(doc.metadata['file_name'] for doc in documents))}")
         print(f"📊 Total chunks created: {len(documents)}")
+        
+        # Add documents to vector store
+        print("\n🔄 Adding documents to vector store...")
+        vector_store = VectorStore()
+        
+        # Use local embeddings if configured
+        if vector_store.initialize(use_local_embeddings=config.USE_LOCAL_LLM):
+            if vector_store.add_documents(documents):
+                print("✅ Documents successfully added to vector store!")
+                # Verify
+                count = vector_store.get_collection_info()
+                print(f"✅ Vector store now contains {count} document chunks")
+            else:
+                print("❌ Failed to add documents to vector store")
+        else:
+            print("❌ Failed to initialize vector store")
     else:
         print("No documents were processed. Make sure you have PDF, DOCX, TXT, or MD files in the documents folder.")      
