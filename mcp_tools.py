@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 
 @dataclass
-class MCPToolResult:
+class ToolResult:
     success: bool
     content: str
     error: Optional[str] = None
@@ -16,18 +16,18 @@ class MCPToolResult:
     
     
     
-class MCPTools:
-    """mcp tools for filesystem and system operations"""
+class FilesystemTools:
+    """Filesystem operation tools (MCP-style interface, not true MCP protocol)"""
     def __init__(self, base_directory: str = None):
         self.base_directory = Path(base_directory) if base_directory else Path.cwd()
         self.allowed_extensions = {'.txt', '.md', '.pdf', '.docx', '.py','.json','.csv'}
         
-    def list_directory(self, path: str=".")-> MCPToolResult:
+    def list_directory(self, path: str=".")-> ToolResult:
         """list contents of a directory"""
         try:
             target_path = self.base_directory / path
             if not target_path.exists():
-                return MCPToolResult(False, "", f"Path {target_path} does not exist.")
+                return ToolResult(False, "", f"Path {target_path} does not exist.")
             
             items = []
             for item in target_path.iterdir():
@@ -44,35 +44,35 @@ class MCPTools:
                 size_str = f" ({item['size']} bytes)" if item['size'] is not None else ""
                 content += f"- {item['name']} [{item['type']}{size_str}]\n"
             
-            return MCPToolResult(True, content, metadata={"items": items})
+            return ToolResult(True, content, metadata={"items": items})
         except Exception as e:
-            return MCPToolResult(False, "", f"error listing directory: {str(e)}")  
+            return ToolResult(False, "", f"error listing directory: {str(e)}")  
             
     
-    def read_file(self, filepath: str) -> MCPToolResult:
+    def read_file(self, filepath: str) -> ToolResult:
         """read content of a file"""
         try:
             target_path = self.base_directory / filepath
             if not target_path.exists() or not target_path.is_file():
-                return MCPToolResult(False, "", f"File {target_path} does not exist.")
+                return ToolResult(False, "", f"File {target_path} does not exist.")
             if target_path.suffix.lower() not in self.allowed_extensions:
-                return MCPToolResult(False, "", f"File type {target_path.suffix} is not supported.")
+                return ToolResult(False, "", f"File type {target_path.suffix} is not supported.")
             with open(target_path, "r", encoding="utf-8") as file:
                 content = file.read()
                 
-            return MCPToolResult(True, content, metadata={
+            return ToolResult(True, content, metadata={
                 "file_name": target_path.name,
                 "file_path": str(target_path),
                 "size": target_path.stat().st_size,
                 "lines": content.count("\n") + 1
             })
         except UnicodeDecodeError:
-            return MCPToolResult(False, "", f"Error decoding file {target_path}.")
+            return ToolResult(False, "", f"Error decoding file {target_path}.")
         except Exception as e:
-            return MCPToolResult(False, "", f"error reading file: {str(e)}")  
+            return ToolResult(False, "", f"error reading file: {str(e)}")  
         
         
-    def write_file(self,filepath: str, content:str, append: bool=False)-> MCPToolResult:
+    def write_file(self,filepath: str, content:str, append: bool=False)-> ToolResult:
         """write content to a file"""
         try:
             target_path= self.base_directory / filepath
@@ -83,22 +83,22 @@ class MCPTools:
             with open(target_path, mode, encoding="utf-8") as file:
                 file.write(content)
             action= "appended to" if append else "written to "
-            return MCPToolResult(True, f"Content successfully {action} {filepath}.", metadata={
+            return ToolResult(True, f"Content successfully {action} {filepath}.", metadata={
                 "file_name": target_path.name,
                 "file_path": str(target_path),
                 "size": target_path.stat().st_size,
                 "action": action.strip()
             })
         except Exception as e:
-            return MCPToolResult(False, "", f"error writing to file: {str(e)}")
+            return ToolResult(False, "", f"error writing to file: {str(e)}")
         
         
-    def search_files(self,pattern: str, directory: str=".",file_extension: str =None)-> MCPToolResult:
+    def search_files(self,pattern: str, directory: str=".",file_extension: str =None)-> ToolResult:
         """search for files by name pattern in a directory"""
         try:
             target_path = self.base_directory / directory
             if not target_path.exists():
-                return MCPToolResult(False,"", f"Directory {target_path} does not exist.")
+                return ToolResult(False,"", f"Directory {target_path} does not exist.")
             
             matches = []
             search_pattern = f"*{pattern}*" if pattern else "*"
@@ -116,19 +116,19 @@ class MCPTools:
             for match in matches:
                 content += f" {match['path']} ({match['size']}) bytes\n"
                 
-            return MCPToolResult(True, content,metadata={"matches":matches})
+            return ToolResult(True, content,metadata={"matches":matches})
         
         except Exception as e:
-            return MCPToolResult(False, "", f"error searching files: {str(e)}")
+            return ToolResult(False, "", f"error searching files: {str(e)}")
         
         
-    def get_file_info(self,filepath: str) -> MCPToolResult:
+    def get_file_info(self,filepath: str) -> ToolResult:
         """get detailed info about a file"""
         try:
             target_path = self.base_directory / filepath
             
             if not target_path.exists():
-                return MCPToolResult(False, "", f"File {target_path} does not exist.")
+                return ToolResult(False, "", f"File {target_path} does not exist.")
             
             stat = target_path.stat()
             info = {
@@ -149,18 +149,18 @@ class MCPTools:
             content += f"type: {'Directory' if info['is_directory'] else 'File'}\n"
             content += f"extension: {info['extension']}\n"
             
-            return MCPToolResult(True, content, metadata=info)
+            return ToolResult(True, content, metadata=info)
         except Exception as e:
-            return MCPToolResult(False, "", f"error getting file info: {str(e)}")
+            return ToolResult(False, "", f"error getting file info: {str(e)}")
         
         
-    def run_command(self, command: str)-> MCPToolResult:
+    def run_command(self, command: str)-> ToolResult:
         """run a safe system command (limited set)"""
         #safe commands only
         safe_commands = ["ls", "dir","echo", "pwd", "cd","time","date", "whoami"] 
         cmd_parts = command.split()
         if not cmd_parts or cmd_parts[0] not in safe_commands:
-            return MCPToolResult(False, "", "Command not allowed or invalid.")
+            return ToolResult(False, "", "Command not allowed or invalid.")
         
         try:
             result = subprocess.run(
@@ -172,17 +172,17 @@ class MCPTools:
             )  
             
             if result.returncode ==0:
-                return MCPToolResult(True, result.stdout.strip(), metadata={
+                return ToolResult(True, result.stdout.strip(), metadata={
                     "command": command,
                     "output": result.stdout.strip(),
                     "error": result.stderr.strip() if result.stderr else None
                 })
             else:
-                return MCPToolResult(False, "", f"Command failed with error: {result.stderr.strip()}")
+                return ToolResult(False, "", f"Command failed with error: {result.stderr.strip()}")
         except subprocess.TimeoutExpired:
-            return MCPToolResult(False, "", "Command timed out.")
+            return ToolResult(False, "", "Command timed out.")
         except Exception as e:
-            return MCPToolResult(False, "", f"error running command: {str(e)}")
+            return ToolResult(False, "", f"error running command: {str(e)}")
         
         
         
@@ -190,9 +190,9 @@ class MCPTools:
         
 #test mcp tools
 if __name__ == "__main__":
-    print("MCP Tools Test")
+    print("Filesystem Tools Test")
     
-    tools = MCPTools(base_directory=".")
+    tools = FilesystemTools(base_directory=".")
     #test directory listing
     print("\n-- Listing current directory --")
     result = tools.list_directory(".")

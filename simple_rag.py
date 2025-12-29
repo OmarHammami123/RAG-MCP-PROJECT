@@ -4,9 +4,12 @@ from langchain.prompts import PromptTemplate
 from vector_store import VectorStore
 from config import Config
 import google.generativeai as genai
-from mcp_tools import MCPTools, MCPToolResult
+from mcp_tools import FilesystemTools, ToolResult
 import json
 from langchain_community.llms import Ollama
+from langchain_community.tools import DuckDuckGoSearchRun
+from pathlib import Path
+import subprocess
 
 
 class RAGSystem:
@@ -14,8 +17,9 @@ class RAGSystem:
         self.config = Config()
         self.vector_store = None
         self.llm = None
-        self.tools = MCPTools()
+        self.tools = FilesystemTools()
         self.retriever = None
+        self.web_search = DuckDuckGoSearchRun() #free web search tool
         
     def initialize(self):
         """Initialize the RAG system with vector store and LLM"""
@@ -68,7 +72,148 @@ class RAGSystem:
             print(f" Error initializing RAG system: {e}")
             return False
         
+    def evaluate_answer_quality(self, question: str, answer: str, sources: List[Dict])-> Dict[str, Any]:
+        """ask llm to evaluate if the rag answer is good enough or if we should fallback to mcp tools"""
+        evaluation_prompt = f"""You are an answer quality evaluator.
+
+Question: {question}
+
+Answer: {answer}
+
+Sources: {len(sources)} document chunks
+
+Does this answer DIRECTLY and CORRECTLY answer the user's question?
+If the answer says "I don't know" or "not relevant", it's NOT satisfactory.
+
+Return ONLY this JSON (no extra text):
+{{
+  "is_satisfactory": true,
+  "confidence": 0.9,
+  "reason": "brief explanation"
+}}"""   
+        try:
+            response = self.llm.invoke(evaluation_prompt)
+            
+            # Debug: show raw response
+            if not response or len(response.strip()) == 0:
+                print("🐛 DEBUG - LLM returned empty response for evaluation")
+                return {
+                    "is_satisfactory": False,
+                    "confidence": 0.0,
+                    "reason": "LLM returned empty response - assuming unsatisfactory"
+                }
+            
+            print(f"🐛 DEBUG - Raw evaluation response (first 200 chars): {response[:200]}")
+            
+            #clean response
+            if "```json" in response:
+                response = response.split("```json")[1].split("```")[0]
+            elif "```" in response:
+                response = response.split("```")[1]
+            
+            response = response.strip()
+            
+            if not response:
+                print("🐛 DEBUG - Response is empty after cleaning")
+                return {
+                    "is_satisfactory": False,
+                    "confidence": 0.0,
+                    "reason": "Empty response after cleaning"
+                }
+            
+            evaluation = json.loads(response)
+            print(f"🧪 Answer evaluation: {evaluation.get('reason','no reason provided')}")
+            return evaluation
+        except json.JSONDecodeError as e:
+            print(f"⚠️ JSON parsing error in evaluation: {e}")
+            print(f"🐛 DEBUG - Attempted to parse: '{response}'")
+            return {
+                "is_satisfactory": False,
+                "confidence": 0.0,
+                "reason": "JSON parsing failed - assuming unsatisfactory"
+            }
+        except Exception as e:
+            print(f"⚠️ Error evaluating answer quality: {e}")
+            return {
+                "is_satisfactory": False,
+                "confidence": 0.0,
+                "reason": "Error during evaluation"
+            }
+    def find_unprocessed_files(self)-> List[Path]:
+        """find files in documents folder not yet in vector store"""
+        docs_path = Path(self.config.DOCUMENTS_PATH)
+        if not docs_path.exists():
+            print(f'Document path {docs_path} does not exist.')
+            return []
+        #get all supported files
+        all_files = []
+        for ext in ["*.pdf", "*.docx", "*.txt", "*.md"]:
+            all_files.extend(docs_path.rglob(ext))
         
+        #get files already in vector store
+        try:
+            collection = self.vector_store.vector_store._collection
+            metadata = collection.get(include=["metadatas"])
+            processed_files = set(m.get('file_name') for m in metadata['metadatas'] if m.get('file_name'))
+        except:
+            processed_files = set()
+        #find unprocessed files
+        unprocessed_files = [f for f in all_files if f.name not in processed_files]
+        
+        if unprocessed_files:
+            print(f" Found {len(unprocessed_files)} unprocessed files.")
+            for f in unprocessed_files:
+                print(f" - {f.name}")
+        return unprocessed_files
+    
+    def process_new_files(self)->bool:
+        """trigger document processing for new files not yet in vector store"""
+        try:
+            print("processing new files...")
+            result = subprocess.run(
+                ["uv", "run", "document_processor.py"],
+                capture_output=True,
+                text=True,
+                timeout=200
+                
+            )
+            if result.returncode ==0:
+                print(" new files processed successfully.")
+                #reinitialize retriever to get new data
+                self.retriever = self.vector_store.vector_store.as_retriever(
+                    search_type="similarity",
+                    search_kwargs={"k": 5}
+                )
+                return True
+            else:
+                print(f" Error processing new files: {result.stderr}")
+                return False
+        except Exception as e:
+            print(f" Exception processing new files: {e}")
+            return False
+        
+        
+    def web_search_fallback(self, question: str)->str:
+         """search the internet when local documents dont have the answer"""        
+         try:
+             print(" performing web search fallback...")
+             search_results = self.web_search.run(question)
+             
+             #ask llm to synthesize a brief answer from search results
+             synthesis_prompt = f"""Based on these web search results, answer the user's question.
+
+Question: {question}
+
+Search Results:
+{search_results}
+
+Provide a clear, concise answer:"""
+             answer = self.llm.invoke(synthesis_prompt)
+             return f"**Web Search Result:**\n\n{answer} \n\n_source : DuckDuckGo Search_"
+         except Exception as e:
+             print(f" Error during web search fallback: {e}")
+             return " Error performing web search."  
+                                            
         
     def detect_intent_keyword(self, question: str) -> Dict[str, str]:
         """Fast, free keyword detection to save time/quota"""
@@ -190,74 +335,236 @@ Return ONLY JSON with "action" and "parameter":"""
         """
         return PromptTemplate(template=template, input_variables=["context", "question"])
     
-    def query(self,question: str)->Dict[str, Any]:
-        """Main query handler: Try RAG first, fallback to MCP tools"""
+    
+
+    def query(self, question: str) -> Dict[str, Any]:
+        """Main query handler with multi-stage intelligence"""
         if not self.vector_store or not self.llm:
-            return{
-                "answer": "❌ RAG system not initialized. Call initialize() first.",
+            return {
+                "answer": "❌ RAG system not initialized.",
                 "sources": []
-            }                        
+            }
         
-        # STEP 1: Always try RAG first
-        print("🔍 Searching course documents...")
+        # Fast path: Check for simple MCP commands first
+        keyword_decision = self.detect_intent_keyword(question)
+        if keyword_decision:
+            print("⚡ Fast keyword match - executing MCP tool directly")
+            action = keyword_decision['action']
+            parameter = keyword_decision['parameter']
+            tool_output = self.execute_tool_action(action, parameter)
+            return {
+                "answer": f"**Tool Output ({action}):**\n\n{tool_output}",
+                "sources": [],
+                "context": "MCP Tool (keyword detection)"
+            }
+        
+        # STAGE 1: Try RAG
+        print("🔍 Stage 1: Searching course documents...")
         try:
-            # Debug: Check if retriever exists and vector store has data
-            print(f"🐛 DEBUG - Retriever exists: {self.retriever is not None}")
-            if self.vector_store:
-                collection = self.vector_store.vector_store._collection
-                print(f"🐛 DEBUG - Documents in vector store: {collection.count()}")
-            
             relevant_docs = self.retriever.invoke(question)
-            print(f"🐛 DEBUG - Retrieved {len(relevant_docs)} documents")
+            print(f"📄 Retrieved {len(relevant_docs)} documents")
             
             if relevant_docs and len(relevant_docs) > 0:
-                # Found documents! Generate answer from them
                 context = "\n\n".join([d.page_content for d in relevant_docs])
                 prompt_template = self.create_rag_prompt()
                 prompt = prompt_template.format(context=context, question=question)
                 
-                print(f"✅ Found {len(relevant_docs)} relevant documents. Generating answer...")
-                response = self.llm.invoke(prompt)
+                print("🤖 Generating answer from documents...")
+                rag_answer = self.llm.invoke(prompt)
+                
+                print(f"🐛 DEBUG - RAG Answer preview: {rag_answer[:150]}...")
                 
                 sources = [
-                    {"filename": doc.metadata.get('file_name', 'Unknown'),
-                     "chunk_id": doc.metadata.get('chunk_index', 0)} 
+                    {
+                        "file_name": doc.metadata.get("file_name", "Unknown"),
+                        "chunk_index": doc.metadata.get("chunk_index", 0)
+                    }
                     for doc in relevant_docs
                 ]
                 
-                return {
-                    "answer": response,
-                    "sources": sources,
-                    "context": "RAG"
-                }
+                # STAGE 2: Evaluate answer quality
+                print("🧪 Stage 2: Evaluating answer quality...")
+                evaluation = self.evaluate_answer_quality(question, rag_answer, sources)
+                
+                print(f"🐛 DEBUG - Evaluation result: {evaluation}")
+                
+                if evaluation.get("is_satisfactory", False):
+                    print("✅ Answer is satisfactory!")
+                    return {
+                        "answer": rag_answer,
+                        "sources": sources,
+                        "context": "RAG",
+                        "confidence": evaluation.get("confidence", 0.0)
+                    }
+                else:
+                    print(f"⚠️ Answer not satisfactory: {evaluation.get('reason')}")
+        
         except Exception as e:
-            print(f"⚠️ RAG search error: {e}")
+            print(f"⚠️ RAG failed: {e}")
         
-        # STEP 2: RAG found nothing or failed - Try MCP tools
-        print("⚠️ No relevant documents found. Checking filesystem with MCP tools...")
+        # STAGE 3: Ask LLM to check for unprocessed files using MCP
+        print("🤔 Stage 3: Asking LLM to check for unprocessed files...")
         
-        # Use the router to decide which tool
-        decision = self.decide_action(question)
-        action = decision.get("action", "rag_search")
-        parameter = decision.get("parameter")
+        file_check_prompt = f"""The RAG system couldn't answer this question well: "{question}"
+
+You have access to MCP filesystem tools. Check if there are unprocessed documents that might help.
+
+Available tools:
+- list_files: List files in documents folder
+- search_files: Find files by pattern (e.g., "*.pdf")
+
+Your task:
+1. List files in the "documents" folder
+2. Check if there are files that might be relevant to: "{question}"
+3. Respond with JSON:
+{{
+  "action": "list_files" or "search_files",
+  "parameter": "documents" or search pattern,
+  "reasoning": "why you chose this"
+}}
+
+Return ONLY JSON:"""
+
+        try:
+            response = self.llm.invoke(file_check_prompt)
+            
+            # Clean response
+            if "```json" in response:
+                response = response.split("```json")[1].split("```")[0]
+            elif "```" in response:
+                response = response.split("```")[1]
+            
+            decision = json.loads(response.strip())
+            print(f"🔧 LLM decided: {decision.get('action')} - {decision.get('reasoning', 'No reason')}")
+            
+            # Execute the MCP tool the LLM chose
+            action = decision.get("action")
+            parameter = decision.get("parameter")
+            tool_result = self.execute_tool_action(action, parameter)
+            
+            print(f"📂 MCP Tool Result:\n{tool_result[:200]}...")
+            
+            # STAGE 4: Ask LLM if it found unprocessed files
+            analysis_prompt = f"""You checked the filesystem and got this result:
+
+{tool_result}
+
+Original question: "{question}"
+
+Analyze:
+1. Are there NEW files (not yet processed) that might answer the question?
+2. Should we process them and try again?
+
+Respond with JSON:
+{{
+  "has_new_files": true/false,
+  "files_to_process": ["file1.pdf", "file2.docx"],
+  "should_retry": true/false,
+  "reasoning": "explanation"
+}}
+
+Return ONLY JSON:"""
+
+            analysis_response = self.llm.invoke(analysis_prompt)
+            
+            # Clean response
+            if "```json" in analysis_response:
+                analysis_response = analysis_response.split("```json")[1].split("```")[0]
+            elif "```" in analysis_response:
+                analysis_response = analysis_response.split("```")[1]
+            
+            
+
+            analysis = json.loads(analysis_response.strip())
+            print(f"📊 Analysis: {analysis.get('reasoning')}")
+            
+            if analysis.get("has_new_files", False) and analysis.get("should_retry", False):
+                print(f"🔄 Found new files: {analysis.get('files_to_process')}. Processing...")
+                
+                if self.process_new_files():
+                    print("♻️  Retrying RAG with newly processed documents...")
+                    
+                    # Retry RAG
+                    relevant_docs = self.retriever.invoke(question)
+                    if relevant_docs and len(relevant_docs) > 0:
+                        context = "\n\n".join([d.page_content for d in relevant_docs])
+                        prompt_template = self.create_rag_prompt()
+                        prompt = prompt_template.format(context=context, question=question)
+                        
+                        rag_answer = self.llm.invoke(prompt)
+                        sources = [
+                            {
+                                "file_name": doc.metadata.get("file_name", "Unknown"),
+                                "chunk_index": doc.metadata.get("chunk_index", 0)
+                            }
+                            for doc in relevant_docs
+                        ]
+                        
+                        return {
+                            "answer": rag_answer,
+                            "sources": sources,
+                            "context": "RAG (after processing new files)"
+                        }
+            else:
+                # LLM said no new files or shouldn't retry
+                # Ask if the existing files are sufficient
+                print("📋 No new files to process. Checking if existing info is sufficient...")
+                
+                final_decision_prompt = f"""The filesystem check showed:
+{tool_result}
+
+Analysis: {analysis.get('reasoning')}
+
+Original question: "{question}"
+
+Should we:
+1. Web search (if we have NO relevant local files)
+2. Stop here (if we found files but they're already processed, or question is not relevant to documents)
+
+Return JSON:
+{{
+  "action": "web_search" or "stop",
+  "reasoning": "brief explanation"
+}}
+
+Return ONLY JSON:"""
+
+                final_response = self.llm.invoke(final_decision_prompt)
+                
+                # Clean response
+                if "```json" in final_response:
+                    final_response = final_response.split("```json")[1].split("```")[0]
+                elif "```" in final_response:
+                    final_response = final_response.split("```")[1]
+                
+                final_decision = json.loads(final_response.strip())
+                print(f"🎯 Final decision: {final_decision.get('action')} - {final_decision.get('reasoning')}")
+                
+                if final_decision.get("action") == "stop":
+                    return {
+                        "answer": f"❌ Unable to answer this question with available resources.\n\n{final_decision.get('reasoning')}",
+                        "sources": [],
+                        "context": "No suitable data"
+                    }
+                # If action is "web_search", continue to Stage 5 below
         
-        print(f"👉 Decided action: {action} with parameter: {parameter}")
+        except Exception as e:
+            print(f"⚠️ File check failed: {e}")
         
-        # If LLM still says "rag_search", we're out of options
-        if action == "rag_search":
-            return {
-                "answer": "❌ Je n'ai trouvé aucune information sur ce sujet dans vos documents ni dans vos fichiers.",
-                "sources": [],
-                "context": "No results"
-            }
+        # STAGE 5: Web search fallback (only if we get here)
+        print("🌐 Stage 5: Searching the web...")
+        web_answer = self.web_search_fallback(question)
         
-        # Execute the MCP tool
-        tool_output = self.execute_tool_action(action, parameter)
         return {
-            "answer": f"**Tool Output ({action}):**\n\n{tool_output}",
+            "answer": web_answer,
             "sources": [],
-            "context": "Tool execution"
-        }                
+            "context": "Web Search"
+        }
+
+
+
+               
+       
     def interactive_chat(self):
         """start interactive chat session"""
         print("\n Smart Notes Assistant - Interactive Mode")
