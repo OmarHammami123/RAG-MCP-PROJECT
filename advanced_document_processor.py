@@ -144,7 +144,7 @@ class AdvancedDocumentProcessor:
             return sections
             
         except Exception as e:
-            print(f"⚠️ Error extracting PDF sections: {e}")
+            print(f" Error extracting PDF sections: {e}")
             import traceback
             traceback.print_exc()
             return []
@@ -209,16 +209,16 @@ class AdvancedDocumentProcessor:
     
     def process_pdf(self, pdf_path: Path) -> List[Document]:
         """Process PDF with section-based + sliding window chunking"""
-        print(f"\n📄 Processing PDF: {pdf_path.name}")
+        print(f"\n Processing PDF: {pdf_path.name}")
         
         # Extract sections
         sections = self.extract_sections_from_pdf(pdf_path)
         
         if not sections:
-            print(f"   ⚠️ No sections found in {pdf_path.name}")
+            print(f"    No sections found in {pdf_path.name}")
             return []
         
-        print(f"   📋 Found {len(sections)} sections")
+        print(f"    Found {len(sections)} sections")
         
         # Chunk each section
         all_chunks = []
@@ -226,7 +226,7 @@ class AdvancedDocumentProcessor:
             chunks = self.chunk_section_with_overlap(section_info, pdf_path.name)
             all_chunks.extend(chunks)
         
-        print(f"   ✅ Created {len(all_chunks)} chunks ({len(all_chunks) - len(sections)} overlapping)")
+        print(f"    Created {len(all_chunks)} chunks ({len(all_chunks) - len(sections)} overlapping)")
         
         # Add global chunk indices
         for idx, chunk in enumerate(all_chunks):
@@ -236,7 +236,7 @@ class AdvancedDocumentProcessor:
     
     def process_docx(self, docx_path: Path) -> List[Document]:
         """Process DOCX (simpler structure)"""
-        print(f"\n📄 Processing DOCX: {docx_path.name}")
+        print(f"\n Processing DOCX: {docx_path.name}")
         
         try:
             doc = DocxDocument(str(docx_path))
@@ -279,7 +279,7 @@ class AdvancedDocumentProcessor:
                 )
                 all_chunks.extend(chunks)
             
-            print(f"   ✅ Created {len(all_chunks)} chunks")
+            print(f"    Created {len(all_chunks)} chunks")
             
             # Add indices
             for idx, chunk in enumerate(all_chunks):
@@ -288,7 +288,7 @@ class AdvancedDocumentProcessor:
             return all_chunks
             
         except Exception as e:
-            print(f"⚠️ Error processing DOCX: {e}")
+            print(f" Error processing DOCX: {e}")
             return []
     
     def process_directory(self, directory_path: str = None) -> List[Document]:
@@ -296,11 +296,11 @@ class AdvancedDocumentProcessor:
         docs_path = Path(directory_path or self.config.DOCUMENTS_PATH)
         
         if not docs_path.exists():
-            print(f"❌ Directory {docs_path} does not exist!")
+            print(f" Directory {docs_path} does not exist!")
             return []
         
-        print(f"\n🔄 Processing documents from {docs_path}...")
-        print(f"📊 Strategy: Section-based + Contextual Headers + 15% Overlap\n")
+        print(f"\nProcessing documents from {docs_path}...")
+        print(f"Strategy: Section-based + Contextual Headers + 15% Overlap\n")
         
         all_documents = []
         
@@ -313,9 +313,9 @@ class AdvancedDocumentProcessor:
         for docx_file in docs_path.glob("*.docx"):
             chunks = self.process_docx(docx_file)
             all_documents.extend(chunks)
-        
-        print(f"\n✅ Total chunks created: {len(all_documents)}")
-        print(f"📈 Quality improvements:")
+    
+        print(f"\nTotal chunks created: {len(all_documents)}")
+        print(f"Quality improvements:")
         print(f"   - Noise filtered (Page X/Y, headers)")
         print(f"   - Section-aware chunking")
         print(f"   - Contextual headers added")
@@ -325,12 +325,12 @@ class AdvancedDocumentProcessor:
     
     def build_vector_store(self, documents: List[Document], use_local: bool = True):
         """Build vector store"""
-        print(f"\n🔄 Building vector store with {len(documents)} chunks...")
+        print(f"\nBuilding vector store with {len(documents)} chunks...")
         
         vector_store = VectorStore()
         
         if not vector_store.initialize(use_local_embeddings=use_local):
-            print("❌ Failed to initialize vector store")
+            print("ERROR: Failed to initialize vector store")
             return False
         
         try:
@@ -338,19 +338,19 @@ class AdvancedDocumentProcessor:
             
             collection = vector_store.vector_store._collection
             count = collection.count()
-            print(f"✅ Vector store now contains {count} document chunks")
+            print(f"Vector store now contains {count} document chunks")
             
             # Show sample
             if count > 0:
                 sample = collection.get(limit=1, include=["metadatas", "documents"])
-                print(f"\n📋 Sample chunk:")
+                print(f"\nSample chunk:")
                 print(f"   Metadata: {sample['metadatas'][0]}")
                 print(f"   Preview: {sample['documents'][0][:200]}...")
             
             return True
             
         except Exception as e:
-            print(f"❌ Error building vector store: {e}")
+            print(f"ERROR: Error building vector store: {e}")
             return False
 
 

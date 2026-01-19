@@ -26,7 +26,7 @@ class VectorStore:
                 embedding_function = self.embedding_model,
                 persist_directory = self.config.CHROMA_DB_PATH
             )    
-            print("✓ Vector store initialized successfully.")
+            print("[OK] Vector store initialized successfully.")
             return True
         except Exception as e:
             print(f"Error initializing vector store: {e}")
@@ -80,28 +80,28 @@ class VectorStore:
 #test vector store fuctionality
 
 if __name__ == "__main__":
-    print("🔄 Setting up Smart Notes Vector Store...")
+    print("[RELOAD] Setting up Smart Notes Vector Store...")
     
     processor = DocumentProcessor()
     documents = processor.process_documents()
     if documents:
-        print(f"✓ Processed {len(documents)} documents.")
+        print(f"[OK] Processed {len(documents)} documents.")
         
         # Initialize vector store with local embeddings
         vector_store = VectorStore()
         
-        print("\n🚀 Initializing vector store with local embeddings...")
+        print("\n[START] Initializing vector store with local embeddings...")
         success = vector_store.initialize(use_local_embeddings=True)
         
         if success:
-            print("📥 Adding documents to vector store...")
+            print("[ADD] Adding documents to vector store...")
             add_success = vector_store.add_documents(documents)
             
             if add_success:
-                print("✅ Vector store setup complete!")
+                print("[SUCCESS] Vector store setup complete!")
                 
                 # Test search functionality
-                print("\n🔍 Testing search functionality...")
+                print("\n[SEARCH] Testing search functionality...")
                 test_query = "quality control methods"
                 results = vector_store.search(test_query, k=3)
                 
@@ -115,8 +115,8 @@ if __name__ == "__main__":
                 # Show collection info
                 vector_store.get_collection_info()
             else:
-                print("❌ Failed to add documents")
+                print("[ERROR] Failed to add documents")
         else:
-            print("❌ Failed to initialize vector store")
+            print("[ERROR] Failed to initialize vector store")
     else:
-        print("❌ No documents found to process")    
+        print("[ERROR] No documents found to process")    

@@ -8,6 +8,7 @@ wheels/
 .venv/
 
 .env
+remove_emojis.py
 
 chroma_db/
 test_mcp.txt
