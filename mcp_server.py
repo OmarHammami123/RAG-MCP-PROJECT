@@ -6,16 +6,65 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 import os
+import shutil
+from exceptions import MCPSecurityError, MCPToolError, handle_exception
+from logging_config import rag_logger
 
 
 class FilesystemMCPServer:
     """ MCP server for filesystem operations"""
     
-    def __init__(self):
-        self.server = Server("filesystem-tools")
-        self.setup_tools()
+    def __init__(self, base_directory: str= "."):
+        self.server = Server("filesystem-server")
+        self.base_directory = Path(base_directory).resolve()
+        self.logger = rag_logger
+        self.setup_handlers()
+        self.logger.info(f"MCP Server initialized with base directory: {self.base_directory}")
     
-    def setup_tools(self):
+    
+    def is_safe_path(self, user_path: str)-> bool:
+        """
+        validate that user_path doesnt escape base_directory
+        
+        security: prevents path traversal attacks like ../../etc/passwd
+        """    
+        try:
+            #resolve the fulll path
+            requested_path = (self.base_directory / user_path).resolve()
+            return requested_path.is_relative_to(self.base_directory)
+        except(ValueError, OSError):
+            return False
+    
+    
+    def validate_path_or_raise(self, user_path: str)->Path:
+        """
+        validate path and return resolved path object , or raise error
+        raises:
+        MCPSecurityError if path is unsafe or outside allowed directory
+        """
+        if not self.is_safe_path(user_path):
+            raise MCPSecurityError(
+                user_path,
+                reason="path_traversal",
+                base_dir=str(self.base_directory)
+            )
+        return (self.base_directory / user_path).resolve()    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    def setup_handlers(self):
         """Register MCP tools"""
         
         @self.server.list_tools()
@@ -148,7 +197,7 @@ class FilesystemMCPServer:
             ]
         
         @self.server.call_tool()
-        async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
+        async def call_tool(name: str, arguments: Any) -> List[TextContent]:
             """Execute tool calls"""
             
             if name == "list_directory":
@@ -187,7 +236,7 @@ class FilesystemMCPServer:
     async def list_directory(self, path: str) -> List[TextContent]:
         """List directory contents"""
         try:
-            target_path = Path(path).resolve()
+            target_path = self.validate_path_or_raise(path)
             
             if not target_path.exists():
                 return [TextContent(
@@ -218,14 +267,18 @@ class FilesystemMCPServer:
                 result += f"- {entry['name']} [{entry['type']}]{size_str}\n"
             
             return [TextContent(type="text", text=result)]
-            
+        
+        except MCPSecurityError as e:
+            self.logger.error(f"Security violation in list_directory: {e}")
+            return [TextContent(type="text", text=f"[SECURITY ERROR] {e.message}")]
         except Exception as e:
+            handle_exception(e, logger=self.logger)
             return [TextContent(type="text", text=f"Error listing directory: {str(e)}")]
     
     async def read_file(self, path: str) -> List[TextContent]:
         """Read file contents"""
         try:
-            file_path = Path(path).resolve()
+            file_path = self.validate_path_or_raise(path)
             
             if not file_path.exists():
                 return [TextContent(type="text", text=f"Error: File '{path}' does not exist")]
@@ -238,16 +291,20 @@ class FilesystemMCPServer:
             
             result = f"Content of {path}:\n{'='*50}\n{content}\n{'='*50}"
             return [TextContent(type="text", text=result)]
-            
+        
+        except MCPSecurityError as e:
+            self.logger.error(f"Security violation in read_file: {e}")
+            return [TextContent(type="text", text=f"[SECURITY ERROR] {e.message}")]
         except UnicodeDecodeError:
             return [TextContent(type="text", text=f"Error: '{path}' is not a text file (binary file?)")]
         except Exception as e:
+            handle_exception(e, logger=self.logger)
             return [TextContent(type="text", text=f"Error reading file: {str(e)}")]
     
     async def search_files(self, pattern: str, directory: str) -> List[TextContent]:
         """Search for files matching pattern"""
         try:
-            search_path = Path(directory).resolve()
+            search_path = self.validate_path_or_raise(directory)
             
             if not search_path.exists():
                 return [TextContent(type="text", text=f"Error: Directory '{directory}' does not exist")]
@@ -265,13 +322,15 @@ class FilesystemMCPServer:
             
             return [TextContent(type="text", text=result)]
             
+        except ValueError as ve:
+            return [TextContent(type="text", text=f"[security error] {str(ve)}")]    
         except Exception as e:
             return [TextContent(type="text", text=f"Error searching files: {str(e)}")]
     
     async def get_file_info(self, path: str) -> List[TextContent]:
         """Get file information"""
         try:
-            file_path = Path(path).resolve()
+            file_path = self.validate_path_or_raise(path)
             
             if not file_path.exists():
                 return [TextContent(type="text", text=f"Error: '{path}' does not exist")]
@@ -297,33 +356,39 @@ class FilesystemMCPServer:
             
             return [TextContent(type="text", text=result)]
             
+        except ValueError as ve:
+            return [TextContent(type="text", text=f"[security error] {str(ve)}")]    
         except Exception as e:
             return [TextContent(type="text", text=f"Error getting file info: {str(e)}")]
     
     async def create_directory(self, path: str) -> List[TextContent]:
         """Create a new directory"""
         try:
-            dir_path = Path(path).resolve()
+            dir_path = self.validate_path_or_raise(path)
             dir_path.mkdir(parents=True, exist_ok=True)
             return [TextContent(type="text", text=f"[SUCCESS] Created directory: {path}")]
+        except ValueError as ve:
+            return [TextContent(type="text", text=f"[security error] {str(ve)}")]    
         except Exception as e:
             return [TextContent(type="text", text=f"Error creating directory: {str(e)}")]
     
     async def write_file(self, path: str, content: str) -> List[TextContent]:
         """Write content to a file"""
         try:
-            file_path = Path(path).resolve()
+            file_path = self.validate_path_or_raise(path)
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(content, encoding='utf-8')
             return [TextContent(type="text", text=f"[SUCCESS] Wrote {len(content)} bytes to: {path}")]
+        except ValueError as ve:
+            return [TextContent(type="text", text=f"[security error] {str(ve)}")]    
         except Exception as e:
             return [TextContent(type="text", text=f"Error writing file: {str(e)}")]
     
     async def move_file(self, source: str, destination: str) -> List[TextContent]:
         """Move or rename a file"""
         try:
-            source_path = Path(source).resolve()
-            dest_path = Path(destination).resolve()
+            source_path = self.validate_path_or_raise(source)
+            dest_path = self.validate_path_or_raise(destination)
             
             if not source_path.exists():
                 return [TextContent(type="text", text=f"Error: Source '{source}' does not exist")]
@@ -331,13 +396,15 @@ class FilesystemMCPServer:
             dest_path.parent.mkdir(parents=True, exist_ok=True)
             source_path.rename(dest_path)
             return [TextContent(type="text", text=f"[SUCCESS] Moved '{source}' to '{destination}'")]
+        except ValueError as ve:
+            return [TextContent(type="text", text=f"[security error] {str(ve)}")]    
         except Exception as e:
             return [TextContent(type="text", text=f"Error moving file: {str(e)}")]
     
     async def delete_file(self, path: str) -> List[TextContent]:
         """Delete a file or directory"""
         try:
-            target_path = Path(path).resolve()
+            target_path = self.validate_path_or_raise(path)
             
             if not target_path.exists():
                 return [TextContent(type="text", text=f"Error: '{path}' does not exist")]
@@ -349,6 +416,8 @@ class FilesystemMCPServer:
             else:
                 target_path.unlink()
                 return [TextContent(type="text", text=f"[SUCCESS] Deleted file: {path}")]
+        except ValueError as ve:
+            return [TextContent(type="text", text=f"[security error] {str(ve)}")]    
         except Exception as e:
             return [TextContent(type="text", text=f"Error deleting: {str(e)}")]
     

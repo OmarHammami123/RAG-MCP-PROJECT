@@ -4,6 +4,8 @@ from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
 from config import Config
 from document_processor import DocumentProcessor
+from exceptions import VectorStoreInitError, VectorStoreQueryError, EmbeddingError, handle_exception
+from logging_config import rag_logger
 import os 
 
 
@@ -13,6 +15,7 @@ class VectorStore:
         self.embedding_model = None
         self.vector_store = None
         self.collection_name = "smart_notes_collection"
+        self.logger = rag_logger
         
     def initialize(self, use_local_embeddings=True):
         """initilize the vector store and embedding model"""
@@ -26,40 +29,93 @@ class VectorStore:
                 embedding_function = self.embedding_model,
                 persist_directory = self.config.CHROMA_DB_PATH
             )    
-            print("[OK] Vector store initialized successfully.")
+            self.logger.info(f"Vector store initialized: {self.collection_name}")
             return True
         except Exception as e:
-            print(f"Error initializing vector store: {e}")
+            init_error = VectorStoreInitError(
+                collection_name=self.collection_name,
+                original_error=str(e)
+            )
+            handle_exception(init_error, logger=self.logger)
             return False
     
     def add_documents(self, documents: List[Document]):
         """add documents to the vector store"""
         if self.vector_store is None:
-            print("Vector store is not initialized.")
+            error = VectorStoreInitError(message="Vector store is not initialized")
+            handle_exception(error, logger=self.logger)
             return False
         
         try:
-            print(f"adding {len(documents)} documents to vector store...")
+            self.logger.debug(f"Adding {len(documents)} documents to vector store...")
             self.vector_store.add_documents(documents)
             self.vector_store.persist()
-            print("documents added and vector store persisted")
+            self.logger.info(f"Added {len(documents)} documents to vector store")
             return True
         except Exception as e:
-            print(f"Error adding documents to vector store: {e}")
+            embedding_error = EmbeddingError(
+                text=documents[0].page_content[:100] if documents else "",
+                count=len(documents),
+                original_error=str(e)
+            )
+            handle_exception(embedding_error, logger=self.logger)
+            return False
+    
+    def add_documents_with_embeddings(self, documents: List[Document], embeddings: List[List[float]]):
+        """Add documents with pre-calculated embeddings to bypass embedding computation"""
+        if self.vector_store is None:
+            error = VectorStoreInitError(message="Vector store is not initialized")
+            handle_exception(error, logger=self.logger)
+            return False
+        
+        try:
+            self.logger.debug(f"Adding {len(documents)} documents with pre-calculated embeddings...")
+            
+            # Access the underlying ChromaDB collection
+            collection = self.vector_store._collection
+            
+            # Prepare data for ChromaDB
+            ids = [f"doc_{i}_{hash(doc.page_content)}" for i, doc in enumerate(documents)]
+            texts = [doc.page_content for doc in documents]
+            metadatas = [doc.metadata for doc in documents]
+            
+            # Add to ChromaDB with pre-calculated embeddings
+            collection.add(
+                ids=ids,
+                documents=texts,
+                embeddings=embeddings,
+                metadatas=metadatas
+            )
+            
+            self.logger.info(f"Added {len(documents)} documents with cached embeddings")
+            return True
+            
+        except Exception as e:
+            embedding_error = EmbeddingError(
+                text=documents[0].page_content[:100] if documents else "",
+                count=len(documents),
+                original_error=str(e)
+            )
+            handle_exception(embedding_error, logger=self.logger)
             return False
         
     def search(self,query: str, k: int =5) -> List[Document]:
         """perform similarity search in the vector store"""
         if self.vector_store is None:
-            print("Vector store is not initialized.")
+            error = VectorStoreInitError(message="Vector store is not initialized")
+            handle_exception(error, logger=self.logger)
             return []
         
         try:
             results = self.vector_store.similarity_search(query, k=k)
-            print(f"found {len(results)} similar documents for query: {query}")
+            self.logger.debug(f"Found {len(results)} documents for query: {query[:50]}")
             return results
         except Exception as e:
-            print(f"Error performing similarity search: {e}")
+            query_error = VectorStoreQueryError(
+                query=query,
+                original_error=str(e)
+            )
+            handle_exception(query_error, logger=self.logger)
             return []
     
     
@@ -69,10 +125,10 @@ class VectorStore:
             try:
                 collection = self.vector_store._collection
                 count = collection.count()
-                print(f"Collection '{self.collection_name}' has {count} items.")
+                self.logger.debug(f"Collection '{self.collection_name}' has {count} items")
                 return count
             except Exception as e:
-                print(f"Error getting collection info: {e}")
+                self.logger.error(f"Error getting collection info: {e}")
                 return 0
         return 0        
     

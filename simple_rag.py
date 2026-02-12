@@ -1,3 +1,5 @@
+import time
+from caching import QueryCache
 from typing import List, Dict, Any
 from langchain_google_genai import GoogleGenerativeAI
 from langchain.prompts import PromptTemplate
@@ -10,12 +12,22 @@ from langchain_community.llms import Ollama
 from langchain_community.tools import DuckDuckGoSearchRun
 from pathlib import Path
 import subprocess
+import sys
+import atexit
+import os
 
 import asyncio
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client 
 import threading
 
+from logging_config import rag_logger
+from exceptions import (
+    RAGException, LLMException, LLMConnectionError, LLMResponseError,
+    MCPException, MCPConnectionError, MCPToolError,
+    DocumentProcessingException, handle_exception
+)
+import re
 class RAGSystem:
     def __init__(self):
         self.config = Config()
@@ -31,12 +43,106 @@ class RAGSystem:
         self.mcp_client_context = None
         self.mcp_session_context = None
         
+        #init query cache
+        self.query_cache = QueryCache(
+            ttl_minutes=60,
+            cache_dir="cache",
+            persist=True,
+            max_entries=1000
+        )
+        
+        # Initialize logger
+        self.logger = rag_logger
+        self.logger.info("RAG System initialized")
+        
+        # Background processes
+        self.ollama_process = None
+        self.mcp_server_process = None
+        
         # Keep event loop alive in background thread
         self.loop = None
         self.loop_thread = None
         
+    def start_ollama(self):
+        """Start Ollama server in background"""
+        try:
+            # Check if Ollama is already running
+            result = subprocess.run(
+                ["ollama", "list"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            )
+            if result.returncode == 0:
+                self.logger.info("Ollama is already running")
+                return True
+        except:
+            pass
+        
+        # Start Ollama serve in background
+        try:
+            self.logger.info("Starting Ollama server in background...")
+            
+            if sys.platform == "win32":
+                # Windows: use START command to launch in new window
+                self.ollama_process = subprocess.Popen(
+                    ["cmd", "/c", "start", "/min", "ollama", "serve"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NEW_CONSOLE | subprocess.DETACHED_PROCESS
+                )
+            else:
+                # Linux/Mac: use nohup
+                self.ollama_process = subprocess.Popen(
+                    ["nohup", "ollama", "serve"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    preexec_fn=lambda: os.setpgrp()
+                )
+            
+            # Give Ollama time to start (non-blocking check)
+            self.logger.info("Waiting for Ollama to start...")
+            for i in range(10):  # Try for 5 seconds
+                time.sleep(0.5)
+                try:
+                    check = subprocess.run(
+                        ["ollama", "list"],
+                        capture_output=True,
+                        timeout=1,
+                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                    )
+                    if check.returncode == 0:
+                        self.logger.info("Ollama server started successfully")
+                        return True
+                except:
+                    continue
+            
+            self.logger.warning("Ollama may still be starting...")
+            return True
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to start Ollama: {e}. Continuing anyway...")
+            return False
+    
+    def stop_ollama(self):
+        """Stop Ollama server"""
+        if self.ollama_process:
+            try:
+                self.logger.info("Stopping Ollama server...")
+                self.ollama_process.terminate()
+                self.ollama_process.wait(timeout=5)
+                self.logger.info("Ollama server stopped")
+            except Exception as e:
+                self.logger.warning(f"Failed to stop Ollama gracefully: {e}")
+                try:
+                    self.ollama_process.kill()
+                except:
+                    pass
+    
     async def _init_mcp(self):
         """initialize mcp client connection"""
+        self.logger.debug("Initializing MCP connection...")
         try:
             server_params = StdioServerParameters(
                 command="uv",
@@ -78,6 +184,8 @@ class RAGSystem:
     
     def close(self):
         """Explicitly close the system"""
+        self.logger.info("Shutting down RAG system...")
+        
         if self.loop and self.loop.is_running():
             # Submit cleanup to the running loop
             future = asyncio.run_coroutine_threadsafe(self._cleanup_mcp(), self.loop)
@@ -92,6 +200,10 @@ class RAGSystem:
             # Wait for thread
             if self.loop_thread:
                 self.loop_thread.join(timeout=5)
+        
+        # Stop Ollama if we started it
+        if self.config.USE_LOCAL_LLM:
+            self.stop_ollama()
                 
     def __del__(self):
         """cleanup on deletion"""
@@ -179,15 +291,22 @@ class RAGSystem:
         
     def initialize(self):
         """Initialize the RAG system with vector store and LLM"""
+        self.logger.info("Starting RAG system initialization...")
+        start_time = time.time()
         try:
+            # Start Ollama if using local LLM
+            if self.config.USE_LOCAL_LLM:
+                self.logger.info("Starting Ollama server (local LLM mode)...")
+                self.start_ollama()
+            
             # Start event loop in background thread for MCP
-            print("[CONNECT] Starting async event loop...")
+            self.logger.debug("Starting async event loop...")
             self.loop = asyncio.new_event_loop()
             self.loop_thread = threading.Thread(target=self._start_event_loop, daemon=True)
             self.loop_thread.start()
             
             # Initialize MCP client in the background loop
-            print("[CONNECT] Initializing MCP client...")
+            self.logger.debug("Initializing MCP client...")
             future = asyncio.run_coroutine_threadsafe(self._init_mcp(), self.loop)
             try:
                 success = future.result(timeout=10)
@@ -248,7 +367,7 @@ class RAGSystem:
         
     def evaluate_answer_quality(self, question: str, answer: str, sources: List[Dict])-> Dict[str, Any]:
         """ask llm to evaluate if the rag answer is good enough or if we should fallback to mcp tools"""
-        evaluation_prompt = f"""Tu es un évaluateur de qualité de réponses.
+        evaluation_prompt = f"""Tu es un évaluateur de qualité de réponses RAG.
 
 Question: {question}
 
@@ -256,21 +375,27 @@ Réponse: {answer}
 
 Sources: {len(sources)} chunks de documents
 
-RÈGLES SIMPLES - Marquer comme PAS satisfaisant UNIQUEMENT si:
-1. La réponse dit explicitement "je ne trouve pas", "il n'y a pas d'information", "pas mentionné dans les documents"
-2. La réponse utilise des phrases d'incertitude comme "il est possible que", "pourrait être", "peut-être"
-3. La réponse fait des suppositions évidentes sans faits
+RÈGLES D'ÉVALUATION:
 
-Marquer comme SATISFAISANT si:
-- La réponse fournit des informations spécifiques (même si elle cite "selon le document" ou "d'après le contexte")
-- La réponse donne des définitions, explications, ou contenu factuel
-- La réponse référence le matériel source
+✅ MARQUER COMME SATISFAISANT si:
+1. La réponse contient des FAITS CONCRETS, définitions, ou explications spécifiques
+2. La réponse cite ou paraphrase le contenu des documents source
+3. La réponse utilise "selon le document", "d'après le contexte", "le chapitre X indique" (BONNE PRATIQUE !)
+4. La réponse fournit des chiffres, noms, dates, ou détails précis
+
+❌ MARQUER COMME NON SATISFAISANT SEULEMENT si:
+1. La réponse dit explicitement "Je ne trouve pas", "Aucune information", "Pas mentionné dans les documents"
+2. La réponse est vague et ne contient AUCUN fait concret
+3. La réponse invente de toute pièce sans référencer les documents
+4. La réponse est un simple "je ne sais pas"
+
+IMPORTANT: Une réponse qui cite les sources ("selon...", "d'après...") est EXCELLENTE et doit être marquée satisfaisante !
 
 Retourne UNIQUEMENT ce JSON:
 {{
   "is_satisfactory": true,
-  "confidence": 0.8,
-  "reason": "brève explication"
+  "confidence": 0.9,
+  "reason": "La réponse contient des faits spécifiques tirés des documents"
 }}"""   
         try:
             response = self.llm.invoke(evaluation_prompt)
@@ -408,7 +533,7 @@ Retourne UNIQUEMENT ce JSON:
     def web_search_fallback(self, question: str)->str:
          """search the internet when local documents dont have the answer"""        
          try:
-             print(" performing web search fallback...")
+             self.logger.info(f"Performing web search for: {question[:100]}")
              search_results = self.web_search.run(question)
              
              #ask llm to synthesize a brief answer from search results
@@ -421,9 +546,10 @@ Search Results:
 
 Provide a clear, concise answer:"""
              answer = self.llm.invoke(synthesis_prompt)
+             self.logger.info("Web search completed successfully")
              return f"**Web Search Result:**\n\n{answer} \n\n_source : DuckDuckGo Search_"
          except Exception as e:
-             print(f" Error during web search fallback: {e}")
+             self.logger.error(f"Web search failed: {e}")
              return " Error performing web search."  
                                             
         
@@ -586,11 +712,30 @@ Réponse (basée UNIQUEMENT sur le contexte ci-dessus):
 
     def query(self, question: str) -> Dict[str, Any]:
         """Main query handler with multi-stage intelligence"""
+        query_start_time = time.time()
+        
         if not self.vector_store or not self.llm:
+            self.logger.error("Query attempted with uninitialized RAG system")
             return {
                 "answer": "[ERROR] RAG system not initialized.",
                 "sources": []
             }
+        
+        # Skip caching for commands
+        if question.lower() in ['quit', 'exit', 'q', 'ls', 'list', 'cache stats', 'cache clear']:
+            return {"answer": "Command recognized but not processed yet", "sources": [], "context": "command"}
+        
+        self.logger.debug(f"Processing query: {question[:100]}")
+        
+        # CACHE CHECK: Try to get cached result first
+        cached_result = self.query_cache.get(question, k=10)
+        if cached_result:
+            duration = time.time() - query_start_time
+            self.logger.log_query(question, "cache", duration, success=True)
+            self.logger.info("Cache hit - returning cached result")
+            return cached_result
+        
+        self.logger.debug("Cache miss - processing query...")
         
         # Fast path: Check for simple MCP commands first
         keyword_decision = self.detect_intent_keyword(question)
@@ -623,7 +768,34 @@ Réponse (basée UNIQUEMENT sur le contexte ci-dessus):
         # STAGE 1: Try RAG
         print("[SEARCH] Stage 1: Searching course documents...")
         try:
-            relevant_docs = self.retriever.invoke(question)
+            # Reformulate question for better semantic search
+            reformulation_prompt = f"""Reformule cette question en termes techniques pour une recherche dans des documents académiques.
+Garde seulement les mots-clés importants et les termes techniques.
+
+Question: {question}
+
+Reformulation (mots-clés uniquement, pas de phrase complète):"""
+            
+            try:
+                keywords = self.llm.invoke(reformulation_prompt).strip()
+                print(f"[SEARCH] Keywords extracted: {keywords[:100]}")
+                # Search with both original question and keywords
+                docs1 = self.vector_store.search(question, k=5)
+                docs2 = self.vector_store.search(keywords, k=5)
+                # Combine and deduplicate
+                seen_content = set()
+                relevant_docs = []
+                for doc in docs1 + docs2:
+                    content_hash = hash(doc.page_content[:200])
+                    if content_hash not in seen_content:
+                        seen_content.add(content_hash)
+                        relevant_docs.append(doc)
+                        if len(relevant_docs) >= 10:
+                            break
+            except:
+                # Fallback to simple search
+                relevant_docs = self.retriever.invoke(question)
+            
             print(f"[DOC] Retrieved {len(relevant_docs)} documents")
             
             # DEBUG: Show what was retrieved
@@ -656,15 +828,20 @@ Réponse (basée UNIQUEMENT sur le contexte ci-dessus):
                 print(f"[DEBUG] DEBUG - Evaluation result: {evaluation}")
                 
                 if evaluation.get("is_satisfactory", False):
-                    print("[SUCCESS] Answer is satisfactory!")
-                    return {
+                    duration = time.time() - query_start_time
+                    self.logger.log_query(question, "rag", duration, success=True)
+                    self.logger.info(f"RAG answer satisfactory (confidence: {evaluation.get('confidence', 0.0)})")
+                    final_result = {
                         "answer": rag_answer,
                         "sources": sources,
                         "context": "RAG",
                         "confidence": evaluation.get("confidence", 0.0)
                     }
+                    # Cache the successful RAG result
+                    self.query_cache.set(question, final_result, k=10)
+                    return final_result
                 else:
-                    print(f"[WARN] Answer not satisfactory: {evaluation.get('reason')}")
+                    self.logger.warning(f"RAG answer not satisfactory: {evaluation.get('reason')}")
         
         except Exception as e:
             print(f"[WARN] RAG failed: {e}")
@@ -750,11 +927,14 @@ Return ONLY JSON:"""
                             for doc in relevant_docs
                         ]
                         
-                        return {
+                        final_result = {
                             "answer": rag_answer,
                             "sources": sources,
                             "context": "RAG (after processing new files)"
                         }
+                        # Cache the result
+                        self.query_cache.set(question, final_result, k=10)
+                        return final_result
             else:
                 print("[LIST] No new files to process.")
                 
@@ -859,11 +1039,14 @@ Return ONLY JSON:"""
                         
                         keyword_answer = self.llm.invoke(prompt)
                         
-                        return {
+                        final_result = {
                             "answer": keyword_answer,
                             "sources": [{'file_name': chunk['metadata'].get('file_name', 'Unknown')} for chunk in matching_chunks],
                             "context": "Keyword Search (multi-term)"
                         }
+                        # Cache keyword search results
+                        self.query_cache.set(question, final_result, k=10)
+                        return final_result
                 except Exception as e:
                     print(f"[WARN] Multi-term search failed: {e}")
             
@@ -908,24 +1091,33 @@ Return ONLY JSON:"""
                         
                         keyword_answer = self.llm.invoke(prompt)
                         
-                        return {
+                        final_result = {
                             "answer": keyword_answer,
                             "sources": [{'file_name': chunk['metadata'].get('file_name', 'Unknown')} for chunk in matching_chunks],
                             "context": "Keyword Search"
                         }
+                        # Cache keyword search results
+                        self.query_cache.set(question, final_result, k=10)
+                        return final_result
                 except Exception as e:
                     print(f"[WARN] Keyword search failed for '{main_keyword}': {e}")
                     continue
         
         # STAGE 5: Web search fallback (only if we get here)
-        print("[WEB] Stage 5: Searching the web...")
+        self.logger.info("Stage 5: Falling back to web search")
         web_answer = self.web_search_fallback(question)
         
-        return {
+        duration = time.time() - query_start_time
+        self.logger.log_query(question, "web", duration, success=True)
+        
+        final_result = {
             "answer": web_answer,
             "sources": [],
             "context": "Web Search"
         }
+        # Cache web search results
+        self.query_cache.set(question, final_result, k=10)
+        return final_result
 
 
 
@@ -967,10 +1159,12 @@ def main():
     
     # Initialize the system
     if not rag.initialize():
+        rag_logger.error("RAG system initialization failed")
         print("[ERROR] RAG system initialization failed.")
         return
     
     if not rag.vector_store or not rag.llm:
+        rag_logger.error("RAG system initialization failed - missing components")
         print("[ERROR] RAG system initialization failed.")
         return
     
@@ -982,6 +1176,8 @@ def main():
     print("  - 'ls' or 'list' - list files via MCP")
     print("  - 'search <pattern>' - search files via MCP (e.g., 'search *.pdf')")
     print("  - 'read <file>' - read file via MCP")
+    print("  - 'cache stats' - show cache statistics")
+    print("  - 'cache clear' - clear query cache")
     print("  - 'exit' or 'quit' - exit the system")
     print("="*60 + "\n")
     
@@ -994,6 +1190,27 @@ def main():
                 print(" Goodbye!")
                 break
             
+            # Cache management commands
+            if question.lower() == 'cache stats':
+                stats = rag.query_cache.get_stats()
+                print(f"\n{'='*60}")
+                print(" Cache Statistics")
+                print(f"{'='*60}")
+                print(f"Total Queries: {stats['total_queries']}")
+                print(f"Cache Hits: {stats['hits']}")
+                print(f"Cache Misses: {stats['misses']}")
+                print(f"Hit Rate: {stats['hit_rate']}")
+                print(f"Cached Entries: {stats['cached_entries']}")
+                print(f"Evictions: {stats['evictions']}")
+                print(f"TTL: {stats['ttl_minutes']} minutes")
+                print(f"{'='*60}\n")
+                continue
+            
+            if question.lower() == 'cache clear':
+                rag.query_cache.clear()
+                print("\n[OK] Cache cleared successfully!\n")
+                continue
+            
             result = rag.query(question)
             
             print(f"\n{'='*60}")
@@ -1005,6 +1222,9 @@ def main():
         #cleanup mcp connection
         if rag:
             rag.close()
+            # Export final stats
+            rag_logger.export_stats()
+            rag_logger.info("System closed successfully")
             print("[SUCCESS] System closed successfully")           
 
 if __name__ == "__main__":

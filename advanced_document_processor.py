@@ -7,6 +7,8 @@ from config import Config
 import pypdf
 from docx import Document as DocxDocument
 import re
+from embedding_cache import EmbeddingCache
+from logging_config import rag_logger
 
 
 class AdvancedDocumentProcessor:
@@ -40,6 +42,10 @@ class AdvancedDocumentProcessor:
         self.config = Config()
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
+        self.logger = rag_logger
+        
+        # Initialize embedding cache
+        self.embedding_cache = EmbeddingCache()
         
         # Text splitter for long sections
         self.text_splitter = RecursiveCharacterTextSplitter(
@@ -56,6 +62,7 @@ class AdvancedDocumentProcessor:
         print(f"   - Overlap: {chunk_overlap} chars ({int(chunk_overlap/chunk_size*100)}%)")
         print(f"   - Contextual headers: Enabled")
         print(f"   - Noise filtering: Enabled")
+        print(f"   - Embedding cache: Enabled")
     
     def is_noise(self, line: str) -> bool:
         """Check if a line is PDF noise (headers, footers, etc.)"""
@@ -211,6 +218,25 @@ class AdvancedDocumentProcessor:
         """Process PDF with section-based + sliding window chunking"""
         print(f"\n Processing PDF: {pdf_path.name}")
         
+        # Check embedding cache first
+        cached_data = self.embedding_cache.get(str(pdf_path))
+        if cached_data:
+            print(f"    [CACHE HIT] Loading from cache (FAST)")
+            self.logger.info(f"Embedding cache hit for {pdf_path.name}")
+            # Reconstruct Document objects from cached data
+            all_chunks = []
+            for chunk_data in cached_data['embeddings']:
+                doc = Document(
+                    page_content=chunk_data['content'],
+                    metadata=chunk_data['metadata']
+                )
+                all_chunks.append(doc)
+            print(f"    Loaded {len(all_chunks)} chunks from cache")
+            return all_chunks
+        
+        print(f"    [CACHE MISS] Processing document...")
+        self.logger.info(f"Processing {pdf_path.name} (cache miss)")
+        
         # Extract sections
         sections = self.extract_sections_from_pdf(pdf_path)
         
@@ -232,11 +258,49 @@ class AdvancedDocumentProcessor:
         for idx, chunk in enumerate(all_chunks):
             chunk.metadata["chunk_index"] = idx
         
+        # Cache the chunks for future use
+        chunk_data_list = []
+        for chunk in all_chunks:
+            chunk_data_list.append({
+                'content': chunk.page_content,
+                'metadata': chunk.metadata
+            })
+        
+        self.embedding_cache.set(
+            str(pdf_path),
+            chunk_data_list,
+            metadata={
+                'num_chunks': len(all_chunks),
+                'num_sections': len(sections),
+                'file_name': pdf_path.name
+            }
+        )
+        print(f"    Cached chunks for future use")
+        self.logger.info(f"Cached {len(all_chunks)} chunks for {pdf_path.name}")
+        
         return all_chunks
     
     def process_docx(self, docx_path: Path) -> List[Document]:
         """Process DOCX (simpler structure)"""
         print(f"\n Processing DOCX: {docx_path.name}")
+        
+        # Check embedding cache first
+        cached_data = self.embedding_cache.get(str(docx_path))
+        if cached_data:
+            print(f"    [CACHE HIT] Loading from cache (FAST)")
+            self.logger.info(f"Embedding cache hit for {docx_path.name}")
+            all_chunks = []
+            for chunk_data in cached_data['embeddings']:
+                doc = Document(
+                    page_content=chunk_data['content'],
+                    metadata=chunk_data['metadata']
+                )
+                all_chunks.append(doc)
+            print(f"    Loaded {len(all_chunks)} chunks from cache")
+            return all_chunks
+        
+        print(f"    [CACHE MISS] Processing document...")
+        self.logger.info(f"Processing {docx_path.name} (cache miss)")
         
         try:
             doc = DocxDocument(str(docx_path))
@@ -285,10 +349,30 @@ class AdvancedDocumentProcessor:
             for idx, chunk in enumerate(all_chunks):
                 chunk.metadata["chunk_index"] = idx
             
+            # Cache the chunks
+            chunk_data_list = []
+            for chunk in all_chunks:
+                chunk_data_list.append({
+                    'content': chunk.page_content,
+                    'metadata': chunk.metadata
+                })
+            
+            self.embedding_cache.set(
+                str(docx_path),
+                chunk_data_list,
+                metadata={
+                    'num_chunks': len(all_chunks),
+                    'file_name': docx_path.name
+                }
+            )
+            print(f"    Cached chunks for future use")
+            self.logger.info(f"Cached {len(all_chunks)} chunks for {docx_path.name}")
+            
             return all_chunks
             
         except Exception as e:
             print(f" Error processing DOCX: {e}")
+            self.logger.error(f"Error processing DOCX {docx_path.name}: {e}")
             return []
     
     def process_directory(self, directory_path: str = None) -> List[Document]:
@@ -321,10 +405,20 @@ class AdvancedDocumentProcessor:
         print(f"   - Contextual headers added")
         print(f"   - Overlapping windows for continuity")
         
+        # Display cache statistics
+        cache_stats = self.embedding_cache.get_stats()
+        print(f"\nEmbedding Cache Statistics:")
+        print(f"   - Cache hits: {cache_stats['hits']}")
+        print(f"   - Cache misses: {cache_stats['misses']}")
+        print(f"   - Hit rate: {cache_stats['hit_rate']}")
+        print(f"   - Cached files: {cache_stats['cached_files']}")
+        print(f"   - Cache size: {cache_stats['cache_size_mb']} MB")
+        self.logger.info(f"Document processing complete. Cache stats: {cache_stats}")
+        
         return all_documents
     
     def build_vector_store(self, documents: List[Document], use_local: bool = True):
-        """Build vector store"""
+        """Build vector store with embedding caching for performance"""
         print(f"\nBuilding vector store with {len(documents)} chunks...")
         
         vector_store = VectorStore()
@@ -334,11 +428,86 @@ class AdvancedDocumentProcessor:
             return False
         
         try:
-            vector_store.add_documents(documents)
+            # Group documents by file to leverage embedding cache
+            files_docs = {}
+            for doc in documents:
+                file_name = doc.metadata.get('file_name', 'unknown')
+                if file_name not in files_docs:
+                    files_docs[file_name] = []
+                files_docs[file_name].append(doc)
+            
+            print(f"\nProcessing embeddings for {len(files_docs)} files...")
+            
+            total_cached = 0
+            total_computed = 0
+            
+            for file_name, file_docs in files_docs.items():
+                # Create cache key based on document contents (not file hash)
+                import hashlib
+                content_hash = hashlib.md5("".join([d.page_content for d in file_docs]).encode()).hexdigest()
+                cache_key = f"embeddings_{file_name}_{content_hash}"
+                
+                # Try to get cached embeddings
+                # We store as a fake "file" in cache - using content instead of actual file
+                cache_path = self.embedding_cache.cache_dir / f"{content_hash}.pkl"
+                cached_embeddings = None
+                if cache_path.exists():
+                    import pickle
+                    with open(cache_path, 'rb') as f:
+                        cached_embeddings = pickle.load(f)
+                
+                if cached_embeddings:
+                    # Use cached embeddings
+                    print(f"   [{file_name}] Using cached embeddings ({len(file_docs)} chunks)")
+                    self.logger.info(f"Using cached embeddings for {file_name}")
+                    
+                    embeddings = cached_embeddings['embeddings']
+                    vector_store.add_documents_with_embeddings(file_docs, embeddings)
+                    total_cached += len(file_docs)
+                else:
+                    # Compute embeddings
+                    print(f"   [{file_name}] Computing embeddings ({len(file_docs)} chunks)...")
+                    self.logger.info(f"Computing embeddings for {file_name}")
+                    
+                    # Get texts to embed
+                    texts = [doc.page_content for doc in file_docs]
+                    
+                    # Compute embeddings using the embedding model
+                    embeddings = vector_store.embedding_model.embed_documents(texts)
+                    
+                    # Cache the embeddings
+                    import pickle
+                    from datetime import datetime
+                    cache_data = {
+                        'embeddings': embeddings,
+                        'metadata': {
+                            'file_name': file_name,
+                            'num_chunks': len(file_docs),
+                            'embedding_dim': len(embeddings[0]) if embeddings else 0,
+                            'timestamp': datetime.now().isoformat()
+                        }
+                    }
+                    with open(cache_path, 'wb') as f:
+                        pickle.dump(cache_data, f)
+                    self.logger.info(f"Cached embeddings for {file_name}")
+                    
+                    # Add to vector store with pre-computed embeddings
+                    vector_store.add_documents_with_embeddings(file_docs, embeddings)
+                    total_computed += len(file_docs)
+            
+            # Summary
+            print(f"\nEmbedding Processing Summary:")
+            print(f"   - Cached: {total_cached} chunks")
+            print(f"   - Computed: {total_computed} chunks")
+            print(f"   - Total: {total_cached + total_computed} chunks")
+            
+            if total_cached + total_computed > 0:
+                cache_ratio = (total_cached / (total_cached + total_computed)) * 100
+                print(f"   - Cache efficiency: {cache_ratio:.1f}%")
             
             collection = vector_store.vector_store._collection
             count = collection.count()
-            print(f"Vector store now contains {count} document chunks")
+            print(f"\nVector store now contains {count} document chunks")
             
             # Show sample
             if count > 0:
@@ -351,6 +520,9 @@ class AdvancedDocumentProcessor:
             
         except Exception as e:
             print(f"ERROR: Error building vector store: {e}")
+            self.logger.error(f"Error building vector store: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
 

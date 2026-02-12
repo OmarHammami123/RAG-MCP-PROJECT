@@ -1,18 +1,60 @@
+# Python
 __pycache__/
 *.py[oc]
+*.pyo
+*.pyd
+.Python
 build/
 dist/
 wheels/
 *.egg-info
+*.egg
 
+# Virtual Environment
 .venv/
+venv/
+ENV/
+env/
 
+# Environment variables
 .env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Project specific
 remove_emojis.py
-
-chroma_db/
-test_mcp.txt
-
-documents/
-tests/__pycache__/
 update_rag.py
+test_mcp.txt
+ROADMAP.md
+SECURITY_CHECKLIST.md
+COMMIT_READY.md
+
+# Test files (local testing only)
+test_*.py
+debug_*.py
+
+# Database & Cache
+chroma_db/
+cache/
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+logs/
+*.log
+
+# Documents (if you don't want to commit them)
+documents/
+# Uncomment if you want to track documents:
+# !documents/.gitkeep
+
+# Tests cache
+tests/__pycache__/
+.pytest_cache/
+*.pyc
