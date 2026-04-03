@@ -49,10 +49,21 @@ This project uses `uv` for fast Python package management.
 ## 🏗️ Project Structure
 
 *   `simple_rag.py`: Main application entry point and RAG logic.
-*   `mcp_tools.py`: Implementation of filesystem tools.
+*   `mcp_server.py`: Real MCP server used at runtime (stdio, `list_tools`/`call_tool`).
+*   `mcp_tools.py`: Legacy helper module (not in the active MCP runtime path).
 *   `vector_store.py`: Manages ChromaDB vector database.
 *   `document_processor.py`: Handles PDF/DOCX loading and chunking.
 *   `config.py`: Configuration settings.
+
+### MCP Runtime Note
+
+The active MCP flow is:
+
+1. `simple_rag.py` starts `mcp_server.py` via stdio.
+2. `simple_rag.py` calls MCP tools through `mcp_session.call_tool(...)`.
+3. `mcp_server.py` executes the registered tool handlers.
+
+`mcp_tools.py` is not used by the runtime MCP server.
 
 ## 🤖 Technologies
 

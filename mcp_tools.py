@@ -1,5 +1,4 @@
 import os 
-import subprocess
 import json
 import time
 from pathlib import Path
@@ -155,34 +154,12 @@ class FilesystemTools:
         
         
     def run_command(self, command: str)-> ToolResult:
-        """run a safe system command (limited set)"""
-        #safe commands only
-        safe_commands = ["ls", "dir","echo", "pwd", "cd","time","date", "whoami"] 
-        cmd_parts = command.split()
-        if not cmd_parts or cmd_parts[0] not in safe_commands:
-            return ToolResult(False, "", "Command not allowed or invalid.")
-        
-        try:
-            result = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=10
-            )  
-            
-            if result.returncode ==0:
-                return ToolResult(True, result.stdout.strip(), metadata={
-                    "command": command,
-                    "output": result.stdout.strip(),
-                    "error": result.stderr.strip() if result.stderr else None
-                })
-            else:
-                return ToolResult(False, "", f"Command failed with error: {result.stderr.strip()}")
-        except subprocess.TimeoutExpired:
-            return ToolResult(False, "", "Command timed out.")
-        except Exception as e:
-            return ToolResult(False, "", f"error running command: {str(e)}")
+        """Disabled for security: generic shell command execution is not allowed."""
+        return ToolResult(
+            False,
+            "",
+            "run_command is disabled for security reasons. Use explicit filesystem tools instead."
+        )
         
         
         
